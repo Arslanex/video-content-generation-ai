@@ -1,0 +1,83 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Test / lint / type check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# --- Secrets & local config ---
+.env
+.env.*
+!.env.example
+
+# --- Project runtime data (videos, transcripts, clips) ---
+data/*
+!data/.gitkeep
+library.sqlite
+library.sqlite-*
+
+# --- Media (accidental drops in repo root) ---
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.m4a
+*.aac
+
+# --- IDE & editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# --- OS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# --- Cursor / Claude local settings ---
+.claude/
+
+# --- ML / model caches (if ever created inside the repo) ---
+.cache/
+.huggingface/
+mlx_models/
+
+# --- Brand overrides (keep brand.json + logo.png as defaults; ignore custom assets) ---
+brand/*.ttf
+brand/*.otf
+brand/*.woff
+brand/*.woff2
+brand/*.jpg
+brand/*.jpeg
+brand/*.png
+!brand/logo.png
+
+# --- Logs & temp ---
+*.log
+*.tmp
+*.temp
+/tmp/
+data/*

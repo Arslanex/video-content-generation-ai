@@ -1,0 +1,15 @@
+{
+  "accent": "#FF4D2E",
+  "channel": "GİRVAK",
+  "cover": {
+    "style": "gradient",
+    "bg": ["#0B1220", "#1B3A6B"],
+    "bg_dir": "vertical",
+    "title_color": "#FFFFFF",
+    "subtitle_color": "#C2C6D2",
+    "accent_style": "line",
+    "logo_pos": "top-center",
+    "align": "center",
+    "vpos": "center"
+  }
+}
