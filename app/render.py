@@ -39,6 +39,9 @@ def _detect_people(video_path, start: float, end: float, samples: int = 15):
     Döndürür: (src_w, src_h, people) — people her biri:
       {cx, cy, w, h, count, area}  (piksel; count = kaç karede görüldü)
     Model yoksa None döner (çağıran merkez kırpmaya düşer).
+
+    Çoklu yerleşim yalnızca aynı karede birlikte görünen yüzler için kullanılır;
+    sırayla konuşan kişiler (asla aynı anda ekranda değil) tek kişi sayılır.
     """
     import cv2
     import numpy as np
@@ -52,9 +55,10 @@ def _detect_people(video_path, start: float, end: float, samples: int = 15):
     det = cv2.FaceDetectorYN_create(_YUNET_MODEL, "", (src_w, src_h), 0.6)
     det.setInputSize((src_w, src_h))
 
-    boxes = []          # (cx, cy, w, h) piksel
-    frames_with = 0
+    # (frame_idx, cx, cy, w, h) — kare bazında tutulur (eşzamanlılık için)
+    tagged: list[tuple[int, float, float, float, float]] = []
     span = max(end - start, 0.1)
+    frame_idx = 0
     for i in range(samples):
         t = start + span * (i + 0.5) / samples
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
@@ -69,37 +73,54 @@ def _detect_people(video_path, start: float, end: float, samples: int = 15):
             x, y, bw, bh = f[:4]
             if f[-1] < 0.6 or bw < src_w * 0.02:
                 continue
-            boxes.append((x + bw / 2, y + bh / 2, bw, bh))
+            tagged.append((frame_idx, x + bw / 2, y + bh / 2, bw, bh))
             got = True
         if got:
-            frames_with += 1
+            frame_idx += 1
     cap.release()
 
-    if not boxes:
+    if not tagged:
         return src_w, src_h, []
 
     # merkez yakınlığına göre kümele (sabit konumlu konuşmacılar)
     thr = src_w * 0.10
-    clusters: list[list] = []
-    for b in boxes:
+    clusters: list[list[tuple[int, float, float, float, float]]] = []
+    for item in tagged:
+        _, cx, cy, w, h = item
         for c in clusters:
-            mcx = np.mean([z[0] for z in c])
-            mcy = np.mean([z[1] for z in c])
-            if abs(b[0] - mcx) < thr and abs(b[1] - mcy) < thr * 1.5:
-                c.append(b)
+            mcx = np.mean([z[1] for z in c])
+            mcy = np.mean([z[2] for z in c])
+            if abs(cx - mcx) < thr and abs(cy - mcy) < thr * 1.5:
+                c.append(item)
                 break
         else:
-            clusters.append([b])
+            clusters.append([item])
 
-    min_support = max(2, int(0.25 * max(1, frames_with)))
-    people = []
+    min_support = max(2, int(0.25 * max(1, frame_idx)))
+    people: list[dict] = []
+    cluster_frames: list[set[int]] = []
     for c in clusters:
         if len(c) < min_support:
             continue
-        arr = np.array(c, dtype=float)
+        arr = np.array([(z[1], z[2], z[3], z[4]) for z in c], dtype=float)
         cx, cy, w, h = (float(np.median(arr[:, j])) for j in range(4))
         people.append({"cx": cx, "cy": cy, "w": w, "h": h,
                        "count": len(c), "area": w * h})
+        cluster_frames.append({z[0] for z in c})
+
+    if not people:
+        return src_w, src_h, []
+
+    # Aynı karede en fazla kaç farklı kişi var?
+    max_simultaneous = 1
+    for fi in range(frame_idx):
+        n = sum(1 for frames in cluster_frames if fi in frames)
+        max_simultaneous = max(max_simultaneous, n)
+
+    if max_simultaneous <= 1 and len(people) > 1:
+        # Sırayla konuşan konuşmacılar — en baskın yüze odaklan
+        people = [max(people, key=lambda p: p["count"] * p["area"])]
+
     return src_w, src_h, people
 
 
