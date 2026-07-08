@@ -12,6 +12,7 @@ dependencies = [
     # Faz 3: akıl yürütme
     "anthropic>=0.40",
     "pillow>=12.2.0",
+    "textual>=8.2.8",
 ]
 
 # Ağır ML bağımlılıkları faz faz eklenir (kurulumu uzun sürdüğü için ayrı tutuldu).

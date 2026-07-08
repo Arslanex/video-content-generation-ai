@@ -17,7 +17,7 @@ import subprocess
 from rich.console import Console
 
 from . import db
-from .config import output_dir, video_dir
+from .config import clip_dir, video_dir
 
 console = Console()
 
@@ -64,7 +64,6 @@ def export(video_id: str, picks: str, vertical: bool = True) -> None:
     """Seçilen önerileri klip dosyalarına dönüştürür."""
     vdir = video_dir(video_id)
     video_path = vdir / "video.mp4"
-    clips_dir = output_dir(video_id, "clips")   # nihai klipler Masaüstünde
 
     if not video_path.exists():
         raise FileNotFoundError("video.mp4 yok. Önce 'l2s ingest' çalıştır.")
@@ -81,7 +80,18 @@ def export(video_id: str, picks: str, vertical: bool = True) -> None:
     if not selected:
         raise RuntimeError(f"'{picks}' hiçbir öneriyle eşleşmedi.")
 
-    clips_dir.mkdir(exist_ok=True)
+    # supercut çok-parçalı; tek-aralık kesimi yanlış olur → montaj için render'a yönlendir.
+    sc = [r for r in selected if r["fmt"] == "supercut"]
+    if sc:
+        from .render import render as _render
+        sc_picks = ",".join(str(r["id"]) for r in sc)
+        console.print(f"  [dim]{len(sc)} supercut çok-parçalı → montaj için render'a "
+                      f"yönlendiriliyor (renders/): {sc_picks}[/dim]")
+        _render(video_id, sc_picks)
+        selected = [r for r in selected if r["fmt"] != "supercut"]
+        if not selected:
+            return
+
     db.set_stage(video_id, "export", "running")
 
     try:
@@ -91,7 +101,7 @@ def export(video_id: str, picks: str, vertical: bool = True) -> None:
             safe_title = "".join(c if c.isalnum() or c in " -_" else "_"
                                  for c in (r["title"] or "clip"))[:50].strip()
             name = f"{r['fmt']}_{r['id']}_{safe_title}.mp4".replace(" ", "_")
-            out = clips_dir / name
+            out = clip_dir(video_id, r["fmt"]) / name   # ciktilar/<format>/…
             console.print(
                 f"  kesiliyor: [cyan]{r['fmt']}[/cyan] "
                 f"{r['start_sec']:.1f}-{r['end_sec']:.1f}s"
@@ -104,4 +114,6 @@ def export(video_id: str, picks: str, vertical: bool = True) -> None:
         console.print(f"  [red]hata:[/red] {exc}")
         raise
 
-    console.print(f"  [green]✓[/green] {len(selected)} klip  •  [dim]{clips_dir}[/dim]")
+    from .config import output_dir
+    console.print(f"  [green]✓[/green] {len(selected)} klip  •  "
+                  f"[dim]{output_dir(video_id)}[/dim]")

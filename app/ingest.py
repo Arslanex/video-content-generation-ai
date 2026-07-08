@@ -36,10 +36,11 @@ def _extract_audio(video_path, audio_path) -> None:
     )
 
 
-def ingest(url: str) -> str:
+def ingest(url: str, progress_hook=None) -> str:
     """URL'yi indirir, metadatayı DB'ye yazar, video_id döndürür.
 
     İndirilmiş video varsa yeniden indirmez (önbellek).
+    progress_hook verilirse yt-dlp indirme ilerlemesi ona iletilir (TUI ilerleme çubuğu).
     """
     # 1) Metadatayı çek (indirmeden)
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
@@ -85,6 +86,8 @@ def ingest(url: str) -> str:
                 "no_warnings": True,
                 "noprogress": True,
             }
+            if progress_hook is not None:
+                opts["progress_hooks"] = [progress_hook]
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
             if not video_path.exists():
