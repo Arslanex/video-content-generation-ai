@@ -14,7 +14,7 @@ import subprocess
 from rich.console import Console
 
 from . import db
-from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, output_dir, video_dir
+from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, clip_dir, video_dir
 
 console = Console()
 
@@ -394,8 +394,7 @@ def dub(video_id: str, rec_id: int, lang: str = "en", per_speaker: bool = True,
         dub_wav = vdir / f".dub_{rec_id}_{lang}.wav"
         sf.write(str(dub_wav), canvas, sr)
 
-        out_dir = output_dir(video_id, "dubs")   # nihai klipler Masaüstünde
-        out_dir.mkdir(exist_ok=True)
+        out_dir = clip_dir(video_id, rec["fmt"], lang=lang)   # ciktilar/dublajlar/
         safe = "".join(c if c.isalnum() or c in " -_" else "_"
                        for c in (rec["title"] or "clip"))[:40].strip().replace(" ", "_")
         out = out_dir / f"{rec['fmt']}_{rec_id}_{lang}_{safe}.mp4"

@@ -14,7 +14,6 @@ load_dotenv()
 # Proje kökü = bu dosyanın iki üstü (app/config.py -> app/ -> kök)
 ROOT = Path(__file__).resolve().parent.parent
 
-DATA_DIR = ROOT / "data"            # her video için ara dosyalar: data/<video_id>/
 PROMPTS_DIR = ROOT / "prompts"      # Claude sistem promptları + puanlama rubrikleri
 DB_PATH = ROOT / "library.sqlite"   # tek dosyalık yerel veritabanı
 BRAND_DIR = ROOT / "brand"          # marka: logo.png + brand.json (vurgu rengi vb.)
@@ -54,26 +53,54 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-8")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 
 
-# Nihai çıktılar (klipler) kullanıcının Masaüstünde toplanır.
-# L2S_OUTPUT_DIR ile değiştirilebilir.
-OUTPUT_DIR = Path(os.getenv("L2S_OUTPUT_DIR") or (Path.home() / "Desktop" / "long-to-shorts"))
+# Her proje tek bir klasörde toplanır: <BASE_DIR>/<video_id>/
+#   kaynak/    → ara/işleme dosyaları (video.mp4, transcript.json, fused.json, ...)
+#   ciktilar/  → teslim edilebilir yayın dosyaları (formatlara göre alt klasörler)
+#   project.json, <video_id>.zip
+# Varsayılan: ~/Documents/lts  (L2S_OUTPUT_DIR ile değiştirilebilir).
+BASE_DIR = Path(os.getenv("L2S_OUTPUT_DIR") or (Path.home() / "Documents" / "lts"))
+
+# Format → ciktilar alt klasörü
+_FMT_DIR = {
+    "short": "shortlar",
+    "episode": "bolumler",
+    "podcast": "podcastlar",
+    "supercut": "supercutlar",
+}
+
+
+def project_dir(video_id: str) -> Path:
+    """Projenin kök klasörü: <BASE_DIR>/<video_id>/ (yoksa oluşturur)."""
+    d = BASE_DIR / video_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def video_dir(video_id: str) -> Path:
-    """Bir videonun ara dosya (working) klasörünü döndürür (yoksa oluşturur)."""
-    d = DATA_DIR / video_id
+    """Ara/işleme dosyaları klasörü: <proje>/kaynak/ (yoksa oluşturur).
+
+    (İsim geriye dönük uyum için 'video_dir'; artık proje altında 'kaynak'.)
+    """
+    d = project_dir(video_id) / "kaynak"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def output_dir(video_id: str, sub: str = "") -> Path:
-    """Nihai çıktı klasörü (Masaüstü): <Masaüstü>/long-to-shorts/<video_id>/<sub>."""
-    d = OUTPUT_DIR / video_id / sub if sub else OUTPUT_DIR / video_id
+    """Teslim edilebilir çıktı klasörü: <proje>/ciktilar/<sub>/ (yoksa oluşturur)."""
+    base = project_dir(video_id) / "ciktilar"
+    d = base / sub if sub else base
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
+def clip_dir(video_id: str, fmt: str, lang: str | None = None) -> Path:
+    """Bir klibin gideceği çıktı alt klasörü (formata/dublaja göre)."""
+    sub = "dublajlar" if lang else _FMT_DIR.get(fmt, "digerleri")
+    return output_dir(video_id, sub)
+
+
 def ensure_dirs() -> None:
     """Temel klasörlerin var olduğundan emin olur."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     PROMPTS_DIR.mkdir(parents=True, exist_ok=True)

@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS stages (
 );
 
 -- Claude'un ürettiği öneriler + üretim paketleri.
--- fmt: short | episode | podcast
+-- fmt: short | episode | podcast | supercut
+-- (supercut: farklı zamanlardan bağlanan çok-parçalı montaj; parçalar payload.spans'ta)
 CREATE TABLE IF NOT EXISTS recommendations (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     video_id   TEXT NOT NULL,
@@ -52,7 +53,27 @@ CREATE TABLE IF NOT EXISTS recommendations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rec_video ON recommendations(video_id, fmt);
+
+-- Kullanıcı dostu proje adı ↔ video_id eşlemesi (TUI'de takip için).
+-- video_id başta boş olabilir (ingest bitince doldurulur).
+CREATE TABLE IF NOT EXISTS projects (
+    name         TEXT PRIMARY KEY,
+    video_id     TEXT,
+    url          TEXT,
+    dir          TEXT,                     -- proje çıktı klasörü (mutlak yol)
+    status       TEXT DEFAULT 'active',    -- active | done (bitti/arşivlendi)
+    archive_path TEXT,                     -- <video_id>.zip yolu
+    closed_at    TEXT,
+    created_at   TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (video_id) REFERENCES videos(video_id) ON DELETE SET NULL
+);
 """
+
+# Eski DB'lerde projects tablosu eksik kolonlarla oluşmuş olabilir → idempotent ekle.
+_PROJECT_COLS = {
+    "dir": "TEXT", "status": "TEXT DEFAULT 'active'",
+    "archive_path": "TEXT", "closed_at": "TEXT",
+}
 
 
 @contextmanager
@@ -69,9 +90,13 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    """Şemayı oluşturur (idempotent)."""
+    """Şemayı oluşturur (idempotent) + eksik proje kolonlarını ekler."""
     with connect() as conn:
         conn.executescript(SCHEMA)
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(projects)")}
+        for col, decl in _PROJECT_COLS.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {decl}")
 
 
 def upsert_video(meta: dict[str, Any]) -> None:
@@ -148,10 +173,94 @@ def get_recommendations(video_id: str, fmt: str | None = None) -> list[sqlite3.R
         return cur.fetchall()
 
 
-def replace_recommendations(video_id: str, recs: list[dict[str, Any]]) -> None:
-    """Bir video için önerileri tazeler (eskileri silip yenilerini yazar)."""
+# --- projeler (TUI) --------------------------------------------------------
+
+def create_project(name: str, url: str | None = None, video_id: str | None = None) -> None:
+    """Proje adını kaydeder (varsa url/video_id günceller). video_id sonra doldurulabilir."""
     with connect() as conn:
-        conn.execute("DELETE FROM recommendations WHERE video_id = ?", (video_id,))
+        conn.execute(
+            """
+            INSERT INTO projects (name, url, video_id) VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                url=COALESCE(excluded.url, projects.url),
+                video_id=COALESCE(excluded.video_id, projects.video_id)
+            """,
+            (name, url, video_id),
+        )
+
+
+def set_project_video(name: str, video_id: str) -> None:
+    """Bir projeye üretilen video_id'yi bağlar (ingest bitince)."""
+    with connect() as conn:
+        conn.execute("UPDATE projects SET video_id=? WHERE name=?", (video_id, name))
+
+
+def get_project(name: str) -> sqlite3.Row | None:
+    with connect() as conn:
+        return conn.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
+
+
+def project_for_video(video_id: str) -> str | None:
+    """Bir video_id'ye bağlı proje adı (varsa)."""
+    with connect() as conn:
+        row = conn.execute("SELECT name FROM projects WHERE video_id=?", (video_id,)).fetchone()
+        return row["name"] if row else None
+
+
+def list_projects() -> list[sqlite3.Row]:
+    """Projeleri, bağlı video başlığı ve süresiyle birlikte (yeni → eski)."""
+    with connect() as conn:
+        return conn.execute(
+            """
+            SELECT p.name, p.video_id, p.url, p.created_at,
+                   p.status, p.dir, p.archive_path,
+                   v.title, v.duration_sec
+            FROM projects p
+            LEFT JOIN videos v ON v.video_id = p.video_id
+            ORDER BY p.created_at DESC
+            """
+        ).fetchall()
+
+
+def delete_project_full(name: str) -> str | None:
+    """Projeyi ve bağlı videoyu (öneri/adımlar dâhil, FK cascade) siler. video_id döndürür."""
+    with connect() as conn:
+        row = conn.execute("SELECT video_id FROM projects WHERE name=?", (name,)).fetchone()
+        vid = row["video_id"] if row else None
+        if vid:
+            conn.execute("DELETE FROM videos WHERE video_id=?", (vid,))   # recs/stages cascade
+        conn.execute("DELETE FROM projects WHERE name=?", (name,))
+    return vid
+
+
+def mark_project_done(video_id: str, dir_path: str, archive_path: str | None) -> None:
+    """Projeyi 'done' işaretler; çıktı klasörü ve arşiv yolunu yazar."""
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE projects SET status='done', dir=?, archive_path=?,
+                   closed_at=datetime('now')
+            WHERE video_id=?
+            """,
+            (dir_path, archive_path, video_id),
+        )
+
+
+def replace_recommendations(video_id: str, recs: list[dict[str, Any]],
+                            only_fmt: str | None = None) -> None:
+    """Bir video için önerileri tazeler (eskileri silip yenilerini yazar).
+
+    only_fmt verilirse yalnızca o formatın önerileri silinir (ör. supercut'ı,
+    analyze'ın ürettiği short/episode/podcast'i silmeden yeniler).
+    """
+    with connect() as conn:
+        if only_fmt:
+            conn.execute(
+                "DELETE FROM recommendations WHERE video_id = ? AND fmt = ?",
+                (video_id, only_fmt),
+            )
+        else:
+            conn.execute("DELETE FROM recommendations WHERE video_id = ?", (video_id,))
         conn.executemany(
             """
             INSERT INTO recommendations (video_id, fmt, start_sec, end_sec, score, title, payload)

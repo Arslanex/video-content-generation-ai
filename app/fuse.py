@@ -15,6 +15,7 @@ from rich.console import Console
 
 from . import db
 from .config import video_dir
+from .sentences import build_sentences
 
 console = Console()
 
@@ -93,6 +94,9 @@ def fuse(video_id: str) -> None:
             "has_visual_signals": visual is not None,
             "scene_count": len(scenes),
             "segments": fused_segments,
+            # cümle indeksi (kelime zamanlaması + noktalama) — sınır yaslamanın
+            # segment değil CÜMLE sınırına yapılması için tek kaynak
+            "sentences": build_sentences(transcript["segments"]),
             "pauses": pauses,
         }
         (vdir / "fused.json").write_text(

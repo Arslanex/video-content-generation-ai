@@ -135,6 +135,14 @@ def set_hf(
 
 
 @app.command()
+def ui() -> None:
+    """Terminal uygulamasını açar (kütüphane + yeni iş + ilerleme + üretim, tek ekran)."""
+    from .tui import main as _tui
+
+    _tui()
+
+
+@app.command()
 def init() -> None:
     """Klasörleri ve veritabanı şemasını oluşturur (idempotent)."""
     ensure_dirs()
@@ -278,6 +286,26 @@ def analyze(
 
 
 @app.command()
+def supercut(
+    video_id: str,
+    count: int = typer.Option(None, help="En fazla tema/montaj sayısı"),
+    priority: str = typer.Option("balanced", help="viral | educational | emotional | balanced"),
+    focus: str = typer.Option(None, help="Konu odağı, örn: girişimcilik,yatırım"),
+    exclude: str = typer.Option(None, help="Atlanacak konular, örn: reklam,jenerik"),
+) -> None:
+    """Supercut — videonun farklı yerlerinden bağlanan anları tek montaja dizer.
+
+    Claude'u üç geçişte çalıştırır: tema keşfi → montaj kurgusu → tutarlılık kapısı.
+    Yalnızca montaj PLANINI üretir (parçalar payload.spans'ta); render ayrı fazda.
+    analyze önerilerini silmez (yalnızca eski supercut'ları yeniler).
+    """
+    _need_anthropic()
+    from .supercut import supercut as _sc
+
+    _sc(video_id, count=count, priority=priority, focus=focus, exclude=exclude)
+
+
+@app.command()
 def export(
     video_id: str,
     pick: str = typer.Option(..., help="Seçimler, örn: short:1,episode:1 | short | all"),
@@ -299,11 +327,17 @@ def render(
         True, "--cover/--no-cover", "--intro/--no-intro",
         help="Açılış kapağı (başlık + hook). Kapaksız için --no-cover"),
     pad: bool = typer.Option(True, help="Sınırları sessizliğe yasla + ses fade (ani başlangıcı önler)"),
+    crossfade: bool = typer.Option(False, help="Supercut'ta parçalar arası çapraz geçiş (0.3s)"),
+    cap_lang: str = typer.Option(
+        None, "--cap-lang", help="Altyazı dili (dublaj yokken): boş=orijinal, en/es/fr/it/pt/hi"),
 ) -> None:
     """Faz 7 — Seçilen önerileri yayınlanabilir kliplere render eder (yerleşim + altyazı + kapak)."""
+    if cap_lang:
+        _need_anthropic()
     from .render import render as _render
 
-    _render(video_id, pick, layout=layout, captions=captions, intro=intro, pad=pad)
+    _render(video_id, pick, layout=layout, captions=captions, intro=intro, pad=pad,
+            xfade=0.3 if crossfade else 0.0, cap_lang=cap_lang)
 
 
 @app.command()
@@ -316,6 +350,7 @@ def produce(
         True, "--cover/--no-cover", "--intro/--no-intro",
         help="Açılış kapağı. Kapaksız üretmek için --no-cover"),
     lang: str = typer.Option(None, help="Dublajlı reel: hedef dil (en, es, fr, it, pt, hi)"),
+    crossfade: bool = typer.Option(False, help="Supercut'ta parçalar arası çapraz geçiş (0.3s)"),
 ) -> None:
     """Seçilen öneri ID'lerini yayınlanabilir kliplere üretir (recs → ID seç → üret).
 
@@ -326,7 +361,8 @@ def produce(
         _warn_hf_soft()
     from .render import render as _render
 
-    _render(video_id, ids, layout=layout, captions=captions, intro=intro, lang=lang)
+    _render(video_id, ids, layout=layout, captions=captions, intro=intro, lang=lang,
+            xfade=0.3 if crossfade else 0.0)
 
 
 @app.command()
@@ -383,7 +419,36 @@ def recs(video_id: str) -> None:
             console.print(f"  açıklama: {payload['description']}")
         if payload.get("reason"):
             console.print(f"  [dim]gerekçe: {payload['reason']}[/dim]")
+        spans = payload.get("spans")
+        if spans:                                   # supercut: parçaları göster
+            total = payload.get("total_sec")
+            coh = payload.get("coherence")
+            head = f"  [dim]{len(spans)} parça"
+            if total:
+                head += f" · toplam {total:.0f}s"
+            if coh is not None:
+                head += f" · tutarlılık {coh:.0f}"
+            console.print(head + "[/dim]")
+            for sp in spans:
+                role = sp.get("role", "")
+                console.print(
+                    f"    [dim]·[/dim] [magenta]{role}[/magenta] "
+                    f"{sp['start']:.0f}–{sp['end']:.0f}s  "
+                    f"[dim]{sp.get('text_preview', '')}[/dim]"
+                )
         console.print()
+
+
+@app.command()
+def finish(video_id: str) -> None:
+    """Projeyi bitirir: orijinal videoyu siler + çıktıları zip'ler + DB'de 'done' işaretler."""
+    from .lifecycle import finish_project
+
+    res = finish_project(video_id)
+    vid_msg = "silindi" if res["removed_video"] else "zaten yoktu"
+    console.print(f"[green]✓[/green] proje bitirildi  •  video.mp4 {vid_msg}")
+    console.print(f"  arşiv: [cyan]{res['zip']}[/cyan]")
+    console.print(f"  [dim]{res['dir']}[/dim]")
 
 
 @app.command()
