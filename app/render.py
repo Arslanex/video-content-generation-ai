@@ -26,6 +26,9 @@ console = Console()
 _W, _H = 1080, 1920  # short hedef çözünürlüğü (9:16)
 _CAP_WORDS = 3          # ekranda eş zamanlı kelime sayısı
 _CAP_FONT_FRAC = 0.032  # SABİT altyazı font oranı (yükseklik bazlı) — boyut oynamasın
+_SEAM_XFADE = 0.15      # supercut dikişlerinde VARSAYILAN nazik çapraz geçiş (sn).
+                        # Çapraz eşleştirilmiş farklı anlar arası sert sıçramayı yumuşatır;
+                        # kullanıcı "güçlü geçiş" seçerse 0.3'e çıkar. 0.0 = sert kesim.
 
 
 # ----------------------------- yüz/kişi tespiti ------------------------------
@@ -512,17 +515,33 @@ def _padded_bounds(vdir, start: float, end: float,
                    breath: float = 0.3):
     """Klip sınırlarını en yakın TEMİZ segment sınırına yaslar (ani başlangıç/bitişi önler).
 
-    Başı: bir pencere içinde, öncesinde duraklama olan (pause_before=true) en yakın
-    segment başlangıcına yaslar; sonu: pause_after=true olan en yakın segment bitişine.
-    Yaslanan sınırın hemen öncesi/sonrası sessizlik olduğundan, küçük bir `breath`
-    payıyla o sessizliğe girerek nefes payı bırakır. fused.json yoksa değiştirmez.
+    Öncelik CÜMLE sınırıdır: başı en yakın cümle başına, sonu en yakın cümle sonuna
+    yaslar (analyze/supercut zaten cümleye yasladıysa idempotenttir → bozmaz). Cümle
+    indeksi yoksa eski davranışa (pause_before/pause_after segmentleri) düşer.
+    Küçük bir `breath` payı YALNIZCA komşu cümleye taşmayacak kadar (aradaki sessizlik
+    kadar) eklenir. fused.json yoksa değiştirmez.
     """
     import json
 
     p = vdir / "fused.json"
     if not p.exists():
         return start, end
-    segs = json.loads(p.read_text(encoding="utf-8")).get("segments", [])
+    fused = json.loads(p.read_text(encoding="utf-8"))
+    segs = fused.get("segments", [])
+
+    # CÜMLE-hassas yol
+    from . import sentences as S
+    sents = fused.get("sentences") or S.load_sentences(vdir, fused)
+    if sents:
+        ns = S.snap_start(start, sents)
+        ne = S.snap_end(end, sents)
+        prev_end = max((s["end"] for s in sents if s["end"] <= ns), default=0.0)
+        next_start = min((s["start"] for s in sents if s["start"] >= ne), default=ne + breath)
+        ns = ns - min(breath, max(0.0, ns - prev_end))       # yalnız aradaki sessizliğe gir
+        ne = ne + min(breath, max(0.0, next_start - ne))
+        if ne - ns < 1.0:
+            return start, end
+        return round(max(0.0, ns), 2), round(ne, 2)
 
     ns, ne = start, end
     # başlangıç: en yakın temiz giriş noktası (ileri/geri pencere)
@@ -557,6 +576,63 @@ def _clip_words(transcript: dict, clip_start: float, clip_end: float):
                     "word": word,
                 })
     return out
+
+
+def _translated_clip_words(transcript: dict, clip_start: float, clip_end: float,
+                           lang: str, vdir=None):
+    """Klip aralığındaki altyazıyı HEDEF dile çevirip klip-göreli kelime zamanlaması üretir.
+
+    Çeviri cümle (segment) düzeyinde yapılır; çevrilen kelimeler o segmentin GERÇEK
+    zaman aralığına, kelime uzunluğuyla orantılı dağıtılır → süreye oturur. Yerleşim
+    uyumu (satıra bölme) _render_word_png tarafından sağlanır.
+    Dönüş: [{start, end, word}] (klip-göreli saniye), _clip_words ile aynı biçim.
+    """
+    from .dub import LANGS, _translate
+
+    if lang not in LANGS:
+        raise RuntimeError(f"Altyazı dili '{lang}' desteklenmiyor. Diller: {', '.join(LANGS)}.")
+    lang_name = LANGS[lang][2]
+
+    units = []
+    for s in transcript.get("segments", []):
+        if s["end"] <= clip_start or s["start"] >= clip_end:
+            continue
+        txt = (s.get("text") or "").strip()
+        if not txt:
+            continue
+        units.append({
+            "start": max(s["start"], clip_start) - clip_start,
+            "end": min(s["end"], clip_end) - clip_start,
+            "text": txt,
+        })
+    if not units:
+        return []
+
+    context = ""
+    if vdir is not None:
+        import json as _json
+        mp = vdir / "meta.json"
+        if mp.exists():
+            m = _json.loads(mp.read_text(encoding="utf-8"))
+            desc = (m.get("description") or "")[:800]
+            context = f"Başlık: {m.get('title','')}\nKanal: {m.get('channel','')}\nAçıklama: {desc}"
+
+    console.print(f"  altyazı çevirisi (Claude, {len(units)} replik) → {lang_name}…")
+    translations, _gloss = _translate([u["text"] for u in units], lang_name, context=context)
+
+    cap_words: list[dict] = []
+    for u, tr in zip(units, translations):
+        toks = tr.split()
+        if not toks:
+            continue
+        span = max(0.3, u["end"] - u["start"])
+        tot = sum(len(w) for w in toks) or 1
+        t = u["start"]
+        for w in toks:
+            d = span * len(w) / tot
+            cap_words.append({"start": round(t, 3), "end": round(t + d, 3), "word": w})
+            t += d
+    return cap_words
 
 
 def _transparent_png(png_path, w: int, h: int) -> None:
@@ -759,21 +835,337 @@ def _render_podcast(video_path, out_dir, r, start: float, end: float, safe: str)
     cover.unlink(missing_ok=True)
 
 
+def _render_role_label(text: str, png_path, w: int, h: int, accent: str) -> None:
+    """Sol üstte accent renkli bir 'rol' etiketi çizer (kanca/gelişme/kapanış...).
+
+    Tam-kare şeffaf PNG üretir (overlay=0:0 ile bindirilir). Metin boşsa boş kare.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    if not text:
+        img.save(png_path)
+        return
+    draw = ImageDraw.Draw(img)
+    fs = int(h * 0.026)
+    font = _font(fs)
+    t = text.upper()
+    tw = font.getlength(t)
+    ascent, descent = font.getmetrics()
+    px, py = int(fs * 0.6), int(fs * 0.42)
+    m, y = int(w * 0.05), int(h * 0.045)
+    rgb = _hex_rgb(accent)
+    draw.rounded_rectangle(
+        [m, y, m + tw + 2 * px, y + ascent + descent + 2 * py],
+        radius=int(fs * 0.5), fill=rgb + (255,),
+    )
+    lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]   # accent açıksa siyah yazı
+    fg = (0, 0, 0, 255) if lum > 150 else (255, 255, 255, 255)
+    draw.text((m + px, y + py), t, font=font, fill=fg)
+    img.save(png_path)
+
+
+def _accent_flash_png(png_path, w: int, h: int, accent: str, alpha: int = 140) -> None:
+    """Tam-kare yarı saydam accent kare (dikişte kısa 'flash' için)."""
+    from PIL import Image
+
+    Image.new("RGBA", (w, h), _hex_rgb(accent) + (alpha,)).save(png_path)
+
+
+def _burn_structure(video_in, video_out, beats: list[dict], w: int, h: int,
+                    accent: str) -> None:
+    """Montaj yapısını görünür kılar: her parça başına kısa accent flash + rol etiketi
+    bindirir. Altyazıyla aynı concat-demuxer overlay tekniği (ffmpeg metin desteği gerekmez).
+
+    beats: birleşik zaman çizelgesinde [{offset, dur, role}].
+    """
+    beats = [b for b in beats if b.get("dur", 0) > 0]
+    if not beats:
+        shutil.copy(video_in, video_out)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        cap = Path(td)
+        blank = cap / "blank.png"
+        _transparent_png(blank, w, h)
+        flash = cap / "flash.png"
+        _accent_flash_png(flash, w, h, accent)
+        labels: dict[str, Path] = {}
+
+        def label_png(role: str) -> Path:
+            if role not in labels:
+                p = cap / f"lbl_{len(labels)}.png"
+                _render_role_label(role, p, w, h, accent)
+                labels[role] = p
+            return labels[role]
+
+        # parçalar çapraz geçişte örtüşebilir → sıralayıp bir sonraki parçanın
+        # başlangıcına kadarki pencereye sığdır (flash + etiket taşmasın)
+        beats = sorted(beats, key=lambda b: b["offset"])
+        total = max(b["offset"] + b["dur"] for b in beats)
+        entries, cursor = [], 0.0
+        for i, b in enumerate(beats):
+            o = b["offset"]
+            nxt = beats[i + 1]["offset"] if i + 1 < len(beats) else total
+            if o > cursor + 0.02:
+                entries.append((blank, o - cursor))
+                cursor = o
+            avail = max(0.0, nxt - o)
+            fl = min(0.15 if i > 0 else 0.0, avail)   # ilk parçada flash yok
+            if fl > 0:
+                entries.append((flash, fl))
+            role = b.get("role", "")
+            lbl_dur = min(1.4, max(0.0, avail - fl)) if role else 0.0
+            if lbl_dur > 0.05:
+                entries.append((label_png(role), lbl_dur))
+            else:
+                lbl_dur = 0.0
+            cursor = o + fl + lbl_dur
+            if nxt - cursor > 0.02:                   # sonraki parçaya kadar boş
+                entries.append((blank, nxt - cursor))
+                cursor = nxt
+
+        lines = []
+        for path, dur in entries:
+            lines += [f"file '{path}'", f"duration {dur:.3f}"]
+        lines.append(f"file '{entries[-1][0]}'")
+        lst = cap / "list.txt"
+        lst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_in),
+             "-f", "concat", "-safe", "0", "-i", str(lst),
+             "-filter_complex",
+             f"[1:v]format=rgba,scale={w}:{h}[ov];[0:v][ov]overlay=0:0[v]",
+             "-map", "[v]", "-map", "0:a?",
+             "-c:v", "libx264", "-preset", "veryfast", "-c:a", "copy", str(video_out)],
+            check=True,
+        )
+
+
+def _probe_dur(path) -> float:
+    """Üretilmiş bir klibin gerçek süresi (altyazı offset'i birikimli kaymasın diye)."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    return float(out) if out else 0.0
+
+
+def _prepend_cover(content: Path, cover_png, w: int, h: int, intro_dur: float = 2.2) -> None:
+    """İçeriğin başına ~2 sn'lik kapak kartı ekler (dip-to-black geçişle). Yerinde günceller."""
+    tmp = content.with_name(content.stem + ".withintro.mp4")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-loop", "1", "-t", f"{intro_dur}", "-i", str(cover_png),
+         "-i", str(content),
+         "-f", "lavfi", "-t", f"{intro_dur}",
+         "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+         "-filter_complex",
+         f"[0:v]scale={w}:{h},setsar=1,fps=30,format=yuv420p,"
+         f"fade=t=out:st={max(0.0, intro_dur - 0.3):.2f}:d=0.3[ci];"
+         f"[1:v]scale={w}:{h},setsar=1,fps=30,format=yuv420p,"
+         f"fade=t=in:st=0:d=0.35[cm];"
+         f"[ci][cm]concat=n=2:v=1:a=0[v];[2:a][1:a]concat=n=2:v=0:a=1[a]",
+         "-map", "[v]", "-map", "[a]",
+         "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", str(tmp)],
+        check=True,
+    )
+    tmp.replace(content)
+
+
+def _render_supercut(video_path, out_dir, r, vdir, transcript, brand,
+                     layout: bool, captions: bool, intro: bool, pad: bool,
+                     safe: str, lang: str | None = None, xfade: float = 0.0,
+                     cap_lang: str | None = None) -> None:
+    """Supercut: farklı zamanlardan span'leri ayrı ayrı kesip 9:16'ya normalize eder,
+    birleştirir, altyazıyı BİRLEŞİK zaman çizelgesine kaydırıp gömer, logo + kapak ekler.
+
+    layout=True: her span için yüz-farkında yerleşim; kapalıysa merkez kırpım.
+    xfade>0: parçalar arası çapraz geçiş (saniye); 0 ise sert kesim. Tüm zaman
+    çizelgeleri (altyazı, yapı, dublaj) parça başlangıcı = offset - i*xfade ile hizalanır.
+    lang verilirse: her span ayrı dublajlanır, kanvaslar birleşik çizelgede overlap-add ile
+    birleştirilip videoya gömülür + hedef-dil altyazısı (dublajlı reel).
+    """
+    import json
+
+    payload = json.loads(r["payload"] or "{}")
+    spans = payload.get("spans", [])
+    if len(spans) < 2:
+        console.print(f"  [yellow]atlandı:[/yellow] #{r['id']} yeterli parça yok")
+        return
+
+    # geçiş cilası: kullanıcı güçlü geçiş vermediyse dikişlere nazik varsayılan
+    # çapraz geçiş uygula (farklı anlar arası sert sıçrama yerine akıcı beat)
+    if not xfade or xfade <= 0:
+        xfade = _SEAM_XFADE
+    console.print(f"  [dim]geçiş: çapraz {xfade:.2f}s[/dim]")
+
+    W, H = _W, _H
+    src_w, src_h = _video_dims(video_path)
+    cw = min(int(round(src_h * W / H)), src_w)          # merkezden 9:16 kırpma genişliği
+    crop = (f"crop={cw}:{src_h}:(iw-{cw})/2:0,scale={W}:{H},"
+            "setsar=1,fps=30,format=yuv420p")
+
+    lang_tag = f"{lang}_" if lang else ""
+    body = out_dir / f"supercut_{r['id']}_{lang_tag}{safe}.mp4"
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        seg_files: list[Path] = []
+        cap_words: list[dict] = []
+        beats: list[dict] = []           # birleşik zaman çizelgesinde parça sınırları/rolleri
+        offset = 0.0
+        for i, sp in enumerate(spans):
+            s, e = sp["start"], sp["end"]
+            if pad:
+                s, e = _padded_bounds(vdir, s, e)
+            dur = e - s
+            fd = min(0.12, max(0.03, dur / 20))         # dikişte tıkırtıyı önleyen küçük fade
+            segf = tdp / f"seg{i:02d}.mp4"
+            af = (f"afade=t=in:st=0:d={fd:.2f},"
+                  f"afade=t=out:st={max(0.0, dur - fd):.2f}:d={fd:.2f}")
+            cmd = ["ffmpeg", "-y", "-loglevel", "error",
+                   "-ss", f"{s:.2f}", "-to", f"{e:.2f}", "-i", str(video_path)]
+            if layout:                                   # span başına yüz-farkında yerleşim
+                lfc, _ = _build_layout_filter(video_path, s, e, dur)
+                cmd += ["-filter_complex", f"{lfc};[0:a]{af}[a]",
+                        "-map", "[vbase]", "-map", "[a]"]
+            else:                                        # merkez kırpım
+                cmd += ["-vf", crop, "-af", af]
+            cmd += ["-ac", "2", "-ar", "44100",
+                    "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", str(segf)]
+            subprocess.run(cmd, check=True)
+            seg_files.append(segf)
+            actual = _probe_dur(segf) or dur            # gerçek süre (birikimli kayma önlenir)
+            moff = offset - i * xfade                    # birleşik çizelgede parça başlangıcı
+            if captions and transcript:
+                span_words = (_translated_clip_words(transcript, s, e, cap_lang, vdir)
+                              if cap_lang else _clip_words(transcript, s, e))
+                for w in span_words:
+                    cap_words.append({"start": w["start"] + moff,
+                                      "end": w["end"] + moff, "word": w["word"]})
+            beats.append({"offset": moff, "dur": actual, "role": sp.get("role", ""),
+                          "s": s, "e": e})
+            offset += actual
+
+        durs = [b["dur"] for b in beats]
+        if xfade > 0 and len(seg_files) > 1:
+            # çapraz geçiş: xfade (görüntü) + acrossfade (ses) zinciri (tek geçişte)
+            fparts, prev_v, prev_a, acc = [], "[0:v]", "[0:a]", durs[0]
+            for i in range(1, len(seg_files)):
+                vo = "[vx]" if i == len(seg_files) - 1 else f"[vv{i}]"
+                ao = "[ax]" if i == len(seg_files) - 1 else f"[aa{i}]"
+                fparts.append(f"{prev_v}[{i}:v]xfade=transition=fade:"
+                              f"duration={xfade:.3f}:offset={max(0.0, acc - xfade):.3f}{vo}")
+                fparts.append(f"{prev_a}[{i}:a]acrossfade=d={xfade:.3f}{ao}")
+                prev_v, prev_a, acc = vo, ao, acc + durs[i] - xfade
+            cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+            for p in seg_files:
+                cmd += ["-i", str(p)]
+            cmd += ["-filter_complex", ";".join(fparts), "-map", "[vx]", "-map", "[ax]",
+                    "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", str(body)]
+            subprocess.run(cmd, check=True)
+        else:
+            # sert kesim: concat demuxer (tüm parçalar aynı codec/çözünürlük → copy güvenli)
+            listf = tdp / "concat.txt"
+            listf.write_text("\n".join(f"file '{p}'" for p in seg_files) + "\n", encoding="utf-8")
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                 "-i", str(listf), "-c", "copy", str(body)],
+                check=True,
+            )
+
+        # altyazı: birleşik zaman çizelgesine kaydırılmış kelimeler
+        if cap_words:
+            capped = body.with_name(body.stem + ".capped.mp4")   # aynı klasör (cross-device rename yok)
+            burn_word_captions(body, capped, cap_words, W, H)
+            capped.replace(body)
+
+    # bağ dokusu: parça başına accent flash + rol etiketi (yapıyı görünür kılar)
+    if any(b["role"] for b in beats):
+        structured = body.with_name(body.stem + ".struct.mp4")
+        _burn_structure(body, structured, beats, W, H, brand["accent"])
+        structured.replace(body)
+
+    # marka logosu (kapaktan önce, sadece içerik üstüne)
+    if brand["logo"] is not None:
+        _overlay_logo(body, brand["logo"], W, H)
+
+    # açılış kapağı
+    if intro:
+        subtitle = payload.get("hook") or payload.get("description") or ""
+        cover = out_dir / f".scover_{r['id']}.png"
+        _render_cover_png(r["title"] or "", subtitle, cover, W, H, _resolve_cover(brand))
+        _prepend_cover(body, cover, W, H)
+        cover.unlink(missing_ok=True)
+
+    # dublaj: her span'i ayrı seslendir, kanvasları segment süresine kırpıp birleştir,
+    # birleşik zaman çizelgesine gömüp hedef-dil altyazısı yak (dublajlı reel).
+    if lang:
+        import numpy as np
+        import soundfile as sf
+        from .dub import _SR, make_dub_track
+
+        console.print(f"  dublaj ({lang})…  [dim]{len(beats)} parça ayrı seslendirilecek[/dim]")
+        canvases, dcaps = [], []
+        for i, b in enumerate(beats):
+            canvas, _sr, capw, note = make_dub_track(r["video_id"], b["s"], b["e"], lang)
+            console.print(f"  [dim]· parça {i + 1}/{len(beats)}: {note}[/dim]")
+            n = int(b["dur"] * _SR)
+            seg = canvas[:n]
+            if len(seg) < n:                             # kısa kaldıysa sessizlikle tamamla
+                seg = np.concatenate([seg, np.zeros(n - len(seg), dtype=np.float32)])
+            canvases.append(seg)
+            for w in capw:                               # altyazıyı birleşik çizelgeye kaydır
+                dcaps.append({"start": w["start"] + b["offset"],
+                              "end": w["end"] + b["offset"], "word": w["word"]})
+        # overlap-add: her parçayı birleşik çizelgedeki başlangıcına yerleştir
+        # (sert kesimde bitişik = concat; çapraz geçişte dikişte kısa örtüşme)
+        total_sec = max(b["offset"] + b["dur"] for b in beats)
+        buf = np.zeros(int(total_sec * _SR) + _SR, dtype=np.float32)
+        for b, seg in zip(beats, canvases):
+            idx = int(b["offset"] * _SR)
+            buf[idx: idx + len(seg)] += seg
+        dub_audio = np.clip(buf[: int(total_sec * _SR)], -1.0, 1.0)
+
+        intro_off = 2.2 if intro else 0.0               # kapak süresi kadar kaydır
+        full = np.concatenate([np.zeros(int(intro_off * _SR), dtype=np.float32), dub_audio])
+        dwav = body.with_name(body.stem + ".dub.wav")
+        sf.write(str(dwav), full, _SR)
+        tmpa = body.with_name(body.stem + ".dubmux.mp4")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(body), "-i", str(dwav),
+             "-map", "0:v", "-map", "1:a", "-shortest",
+             "-c:v", "copy", "-c:a", "aac", str(tmpa)], check=True)
+        tmpa.replace(body)
+        dwav.unlink(missing_ok=True)
+        if dcaps:
+            shifted = [{"start": w["start"] + intro_off, "end": w["end"] + intro_off,
+                        "word": w["word"]} for w in dcaps]
+            tmpc = body.with_name(body.stem + ".dubcap.mp4")
+            burn_word_captions(body, tmpc, shifted, W, H)
+            tmpc.replace(body)
+
+    console.print(f"  [green]·[/green] {body.name}  •  {len(seg_files)} parça, {offset:.0f}s")
+
+
 def render(video_id: str, picks: str, layout: bool = True, captions: bool = True,
-           intro: bool = True, pad: bool = True, lang: str | None = None) -> None:
+           intro: bool = True, pad: bool = True, lang: str | None = None,
+           xfade: float = 0.0, cap_lang: str | None = None) -> None:
     """Seçilen önerileri render eder: dikey yerleşim + altyazı + kapak + sınır yaslama/fade.
 
     lang verilirse (en, es, ...): görseli üretir, sesi o dile DUBLAJLAR ve hedef-dil
     altyazısı gömer → dikey dublajlı reel. (TR altyazı kapatılır.)
+    cap_lang verilirse (dublaj YOKken): altyazı orijinal yerine o dile çevrilir; boş=orijinal.
+    xfade>0: supercut'ta parçalar arası çapraz geçiş süresi (saniye).
     """
     import json
 
-    if lang:                       # dublajlı reel: TR altyazı yerine dub + EN altyazı
+    if lang:                       # dublajlı reel: altyazı zaten dublaj dilinde (sentezden)
         captions = False
+        cap_lang = None            # dublajda altyazı dili = dublaj dili
 
     vdir = video_dir(video_id)
     video_path = vdir / "video.mp4"
-    out_dir = output_dir(video_id, "renders")   # nihai klipler Masaüstünde
 
     if not video_path.exists():
         raise FileNotFoundError("video.mp4 yok. Önce 'l2s ingest' çalıştır.")
@@ -797,20 +1189,28 @@ def render(video_id: str, picks: str, layout: bool = True, captions: bool = True
     if not selected:
         raise RuntimeError(f"'{picks}' hiçbir öneriyle eşleşmedi.")
 
-    from .config import load_brand
+    from .config import clip_dir, load_brand
     brand = load_brand()
 
-    out_dir.mkdir(exist_ok=True)
     db.set_stage(video_id, "render", "running")
 
     try:
         for r in selected:
             is_short = r["fmt"] == "short"
+            out_dir = clip_dir(video_id, r["fmt"], lang)   # ciktilar/<format|dublajlar>/
             start, end = r["start_sec"], r["end_sec"]
             if pad:
                 start, end = _padded_bounds(vdir, start, end)
             safe = "".join(c if c.isalnum() or c in " -_" else "_"
                            for c in (r["title"] or "clip"))[:50].strip().replace(" ", "_")
+
+            # supercut: çok-parçalı montaj (ayrı yol)
+            if r["fmt"] == "supercut":
+                console.print(f"  render: [cyan]supercut[/cyan] #{r['id']}  montaj"
+                              + (f" [magenta]+dub {lang}[/magenta]" if lang else ""))
+                _render_supercut(video_path, out_dir, r, vdir, transcript, brand,
+                                 layout, captions, intro, pad, safe, lang, xfade, cap_lang)
+                continue
 
             # podcast: ses + audiogram (ayrı yol)
             if r["fmt"] == "podcast":
@@ -844,7 +1244,8 @@ def render(video_id: str, picks: str, layout: bool = True, captions: bool = True
             dur = end - start
             cap_list = None
             if transcript:
-                words = _clip_words(transcript, start, end)
+                words = (_translated_clip_words(transcript, start, end, cap_lang, vdir)
+                         if cap_lang else _clip_words(transcript, start, end))
                 if words:
                     cap_dir = out_dir / f".cap_{r['id']}"
                     cap_dir.mkdir(exist_ok=True)
@@ -974,4 +1375,5 @@ def render(video_id: str, picks: str, layout: bool = True, captions: bool = True
         console.print(f"  [red]hata:[/red] {exc}")
         raise
 
-    console.print(f"  [green]✓[/green] {len(selected)} klip  •  [dim]{out_dir}[/dim]")
+    console.print(f"  [green]✓[/green] {len(selected)} klip  •  "
+                  f"[dim]{output_dir(video_id)}[/dim]")

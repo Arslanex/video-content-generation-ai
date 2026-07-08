@@ -81,14 +81,17 @@ def _preferences_text(formats: list[str], count, priority: str,
 
 
 def _refine(recs: list[dict], segments: list[dict],
-            formats: list[str] | None = None, count: int | None = None
+            formats: list[str] | None = None, count: int | None = None,
+            sentences: list[dict] | None = None
             ) -> tuple[list[dict], list[str]]:
     """Claude önerilerini doğrular/temizler:
-    - start/end'i gerçek segment sınırlarına yaslar,
-    - süreyi format sınırlarına çeker (uzunsa kuyruğu pause_after'a kırpar),
+    - start/end'i CÜMLE sınırlarına yaslar (cümle yoksa segment sınırına — yedek),
+    - süreyi format sınırlarına çeker (uzunsa kuyruğu tam cümleye kırpar),
     - çok kısa/geçersizleri atar, aynı formatta ağır çakışmaları eler (yüksek puan kalır).
     Döndürür: (temiz_öneriler, değişiklik_notları).
     """
+    from . import sentences as S
+
     notes0: list[str] = []
     # istenmeyen formatları ele (güvenlik: prompt'a rağmen gelirse)
     if formats:
@@ -97,12 +100,14 @@ def _refine(recs: list[dict], segments: list[dict],
         if len(recs) < before:
             notes0.append(f"{before - len(recs)} istenmeyen-format önerisi elendi")
 
-    if not segments:
+    if not segments and not sentences:
         return _cap_per_format(recs, count), notes0
 
+    sents = sentences or []
     seg_starts = sorted(s["start"] for s in segments)
     seg_ends = sorted(s["end"] for s in segments)
     pa_ends = sorted(s["end"] for s in segments if s.get("pause_after"))
+    sent_ends = S.ends(sents)
     notes: list[str] = []
 
     def nearest(vals, x):
@@ -111,26 +116,38 @@ def _refine(recs: list[dict], segments: list[dict],
     refined = []
     for r in recs:
         fmt = r["fmt"]
-        s = nearest(seg_starts, r["start_sec"])
-        e = nearest(seg_ends, r["end_sec"])
+        lo, hi = _DURATION.get(fmt, (0, 1e9))
+        if sents:                                   # CÜMLE-hassas yaslama
+            s = S.snap_start(r["start_sec"], sents)
+            e = S.snap_end(r["end_sec"], sents)
+        else:                                        # yedek: segment sınırı
+            s = nearest(seg_starts, r["start_sec"])
+            e = nearest(seg_ends, r["end_sec"])
         if e <= s:
             notes.append(f"{fmt} {r['start_sec']:.0f}s geçersiz (atıldı)")
             continue
-        lo, hi = _DURATION.get(fmt, (0, 1e9))
         dur = e - s
         if dur > hi:
             limit = s + hi
-            cands_pa = [v for v in pa_ends if s < v <= limit]
-            cands = [v for v in seg_ends if s < v <= limit]
-            new_e = max(cands_pa) if cands_pa else (max(cands) if cands else e)
+            if sents:                                # tam CÜMLE sonuna kırp
+                cands = [v for v in sent_ends if s < v <= limit]
+                new_e = max(cands) if cands else S.snap_end(limit, sents)
+            else:
+                cands_pa = [v for v in pa_ends if s < v <= limit]
+                cands = [v for v in seg_ends if s < v <= limit]
+                new_e = max(cands_pa) if cands_pa else (max(cands) if cands else e)
             notes.append(f"{fmt} {dur:.0f}s → {new_e - s:.0f}s kırpıldı")
             e = new_e
         elif dur < lo:
             target = s + lo
-            cands_pa = [v for v in pa_ends if v >= target]
-            cands = [v for v in seg_ends if v >= target]
-            if cands_pa or cands:
-                e = min(cands_pa) if cands_pa else min(cands)
+            if sents:                                # tam CÜMLE sonuna uzat
+                cands = [v for v in sent_ends if v >= target]
+                e = min(cands) if cands else (sent_ends[-1] if sent_ends else e)
+            else:
+                cands_pa = [v for v in pa_ends if v >= target]
+                cands = [v for v in seg_ends if v >= target]
+                if cands_pa or cands:
+                    e = min(cands_pa) if cands_pa else min(cands)
         if e - s < lo * 0.6 or e <= s:
             notes.append(f"{fmt} çok kısa (atıldı)")
             continue
@@ -255,8 +272,11 @@ def analyze(video_id: str, formats: list[str] | None = None, count: int | None =
         data = json.loads(text)
         recs = data.get("recommendations", [])
 
-        # doğrulama/temizleme: format filtresi, süre, sınır yaslama, çakışma, adet
-        recs, notes = _refine(recs, fused.get("segments", []), formats, count)
+        # doğrulama/temizleme: format filtresi, süre, CÜMLE-hassas yaslama, çakışma, adet
+        # (eski fused.json'da 'sentences' yoksa transcript.json'dan kurulur)
+        from . import sentences as _S
+        recs, notes = _refine(recs, fused.get("segments", []), formats, count,
+                              sentences=_S.load_sentences(vdir, fused))
         for n in notes:
             console.print(f"  [dim]· {n}[/dim]")
 
