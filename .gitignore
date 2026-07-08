@@ -81,3 +81,5 @@ brand/*.png
 *.temp
 /tmp/
 data/*
+# Kullanıcı arayüz tercihleri (dil vb.)
+.l2s_prefs.json
